@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build artifacts
+dist/
+build/
+*.zip
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data files (keep structure, ignore content)
+data/*.json
+!data/.gitkeep
+
+# Update data
+update/logdata.json
+update/payout_stats.json
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# QR codes (if generated locally)
+bank/uploads/

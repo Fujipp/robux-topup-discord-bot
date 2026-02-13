@@ -10,13 +10,10 @@ const THUMBNAILS_API_BASE = 'https://thumbnails.roblox.com';
 const TWO_STEP_API_BASE = 'https://twostepverification.roblox.com';
 const TRANSACTION_API_BASE = 'https://apis.roblox.com/transaction-records';
 
-// Cache CSRF token
-let csrfToken = null;
+// Cache CSRF token per cookie
+const csrfTokens = new Map();
 
-/**
- * อ่าน config จาก environment
- */
-function getConfig() {
+function getEnvConfig() {
     return {
         cookie: (process.env.ROBLOX_SECURITY_COOKIE || '').trim(),
         groupId: (process.env.ROBLOX_GROUP_ID || '').trim(),
@@ -24,12 +21,152 @@ function getConfig() {
     };
 }
 
+function normalizeGroupEntry(entry, index) {
+    if (!entry || typeof entry !== 'object') return null;
+    const groupId = String(entry.groupId || entry.group_id || entry.id || '').trim();
+    if (!groupId) return null;
+
+    const cookie = String(
+        entry.cookie ||
+        entry.securityCookie ||
+        entry.robloxSecurityCookie ||
+        ''
+    ).trim();
+
+    const totpSecret = String(
+        entry.totpSecret ||
+        entry.totp ||
+        entry.totp_secret ||
+        ''
+    ).trim().replace(/\s+/g, '');
+
+    const key = String(entry.key || entry.name || groupId || `group_${index + 1}`).trim();
+    const name = String(entry.name || entry.label || `Group ${groupId || key}`).trim();
+
+    return {
+        key,
+        name,
+        groupId,
+        cookie,
+        totpSecret,
+    };
+}
+
+function getNumberedGroupConfigs() {
+    const list = [];
+    for (let i = 1; i <= 3; i += 1) {
+        const groupId = String(process.env[`ROBLOX_GROUP_ID_${i}`] || '').trim();
+        const cookie = String(process.env[`ROBLOX_SECURITY_COOKIE_${i}`] || '').trim();
+        const totpSecret = String(process.env[`ROBLOX_TOTP_SECRET_${i}`] || '').trim().replace(/\s+/g, '');
+        const name = String(process.env[`ROBLOX_GROUP_NAME_${i}`] || `Robux กลุ่ม ${i}`).trim();
+
+        if (groupId || cookie || totpSecret) {
+            list.push({
+                key: `group_${i}`,
+                name,
+                groupId,
+                cookie,
+                totpSecret,
+            });
+        }
+    }
+    return list;
+}
+
+function getGroupConfigs() {
+    const raw = String(process.env.ROBLOX_GROUPS || process.env.ROBLOX_GROUPS_JSON || '').trim();
+    let list = [];
+
+    if (raw) {
+        try {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+                list = parsed.map(normalizeGroupEntry).filter(Boolean);
+            }
+        } catch (err) {
+            console.error('[Roblox] Failed to parse ROBLOX_GROUPS:', err.message);
+        }
+    }
+
+    if (list.length === 0) {
+        list = getNumberedGroupConfigs();
+    }
+
+    if (list.length === 0) {
+        const env = getEnvConfig();
+        if (env.groupId || env.cookie || env.totpSecret) {
+            const name = String(process.env.ROBLOX_GROUP_NAME || `Group ${env.groupId || 'default'}`).trim();
+            list = [{
+                key: 'default',
+                name,
+                groupId: env.groupId,
+                cookie: env.cookie,
+                totpSecret: env.totpSecret,
+            }];
+        }
+    }
+
+    const defaultKey = String(process.env.ROBLOX_GROUPS_DEFAULT || '').trim();
+    const map = {};
+    for (const group of list) {
+        if (!map[group.key]) map[group.key] = group;
+    }
+
+    return {
+        list,
+        map,
+        defaultKey: map[defaultKey] ? defaultKey : (list[0]?.key || null),
+    };
+}
+
+/**
+ * อ่าน config จาก environment
+ */
+function getConfig(groupKey = null) {
+    const groups = getGroupConfigs();
+    if (groups.list.length > 0) {
+        const key = groupKey || groups.defaultKey || groups.list[0].key;
+        return groups.map[key] || groups.list[0];
+    }
+    return getEnvConfig();
+}
+
+function mergeConfig(base, override) {
+    const next = { ...base };
+    if (override.groupId) next.groupId = String(override.groupId).trim();
+    if (override.cookie) next.cookie = String(override.cookie).trim();
+    if (override.totpSecret) next.totpSecret = String(override.totpSecret).trim().replace(/\s+/g, '');
+    return next;
+}
+
+function resolveConfig(groupIdOrOptions) {
+    if (groupIdOrOptions && typeof groupIdOrOptions === 'object') {
+        const base = getConfig(groupIdOrOptions.groupKey || null);
+        return mergeConfig(base, groupIdOrOptions);
+    }
+    const base = getConfig();
+    if (typeof groupIdOrOptions === 'string' && groupIdOrOptions.trim()) {
+        return { ...base, groupId: groupIdOrOptions.trim() };
+    }
+    return base;
+}
+
+function getCsrfToken(cookie) {
+    if (!cookie) return null;
+    return csrfTokens.get(cookie) || null;
+}
+
+function setCsrfToken(cookie, token) {
+    if (!cookie || !token) return;
+    csrfTokens.set(cookie, token);
+}
+
 /**
  * สร้าง TOTP code (เลข 6 หลัก) จาก secret key
  * @returns {string|null} - TOTP code หรือ null ถ้าไม่มี secret
  */
-function generateTOTP() {
-    const { totpSecret } = getConfig();
+function generateTOTP(configOverride = null) {
+    const { totpSecret } = resolveConfig(configOverride);
     if (!totpSecret) {
         console.log('[Roblox] No TOTP secret configured');
         return null;
@@ -47,8 +184,8 @@ function generateTOTP() {
 /**
  * สร้าง headers พื้นฐานสำหรับ Roblox API
  */
-function getHeaders(includeCsrf = false) {
-    const { cookie } = getConfig();
+function getHeaders(includeCsrf = false, configOverride = null) {
+    const { cookie } = resolveConfig(configOverride);
     const headers = {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
@@ -58,8 +195,11 @@ function getHeaders(includeCsrf = false) {
         headers['Cookie'] = `.ROBLOSECURITY=${cookie}`;
     }
 
-    if (includeCsrf && csrfToken) {
-        headers['X-CSRF-TOKEN'] = csrfToken;
+    if (includeCsrf) {
+        const token = getCsrfToken(cookie);
+        if (token) {
+            headers['X-CSRF-TOKEN'] = token;
+        }
     }
 
     return headers;
@@ -70,15 +210,16 @@ function getHeaders(includeCsrf = false) {
  * @param {string} groupId - Group ID (optional, ใช้จาก env ถ้าไม่ระบุ)
  * @returns {Promise<{ok: boolean, data?: object, error?: object}>}
  */
-async function getGroupInfo(groupId = null) {
-    const gid = groupId || getConfig().groupId;
+async function getGroupInfo(groupIdOrOptions = null) {
+    const cfg = resolveConfig(groupIdOrOptions);
+    const gid = cfg.groupId;
     if (!gid) {
         return { ok: false, error: { message: 'missing ROBLOX_GROUP_ID' } };
     }
 
     try {
         const res = await axios.get(`${GROUPS_API_BASE}/v1/groups/${gid}`, {
-            headers: getHeaders(false),
+            headers: getHeaders(false, cfg),
         });
 
         return { ok: true, data: res.data };
@@ -98,9 +239,10 @@ async function getGroupInfo(groupId = null) {
  * @param {string} groupId - Group ID (optional, ใช้จาก env ถ้าไม่ระบุ)
  * @returns {Promise<{ok: boolean, robux?: number, error?: object}>}
  */
-async function getGroupFunds(groupId = null) {
-    const gid = groupId || getConfig().groupId;
-    const { cookie } = getConfig();
+async function getGroupFunds(groupIdOrOptions = null) {
+    const cfg = resolveConfig(groupIdOrOptions);
+    const gid = cfg.groupId;
+    const { cookie } = cfg;
 
     if (!gid) {
         return { ok: false, error: { message: 'missing ROBLOX_GROUP_ID' } };
@@ -111,7 +253,7 @@ async function getGroupFunds(groupId = null) {
 
     try {
         const res = await axios.get(`${ECONOMY_API_BASE}/v1/groups/${gid}/currency`, {
-            headers: getHeaders(false),
+            headers: getHeaders(false, cfg),
         });
 
         return { ok: true, robux: res.data?.robux ?? 0, data: res.data };
@@ -131,9 +273,10 @@ async function getGroupFunds(groupId = null) {
  * @param {string} groupId - Group ID (optional, ใช้จาก env ถ้าไม่ระบุ)
  * @returns {Promise<{ok: boolean, canPayout?: boolean, data?: object, error?: object}>}
  */
-async function getPayoutRestriction(groupId = null) {
-    const gid = groupId || getConfig().groupId;
-    const { cookie } = getConfig();
+async function getPayoutRestriction(groupIdOrOptions = null) {
+    const cfg = resolveConfig(groupIdOrOptions);
+    const gid = cfg.groupId;
+    const { cookie } = cfg;
 
     if (!gid) {
         return { ok: false, error: { message: 'missing ROBLOX_GROUP_ID' } };
@@ -144,7 +287,7 @@ async function getPayoutRestriction(groupId = null) {
 
     try {
         const res = await axios.get(`${GROUPS_API_BASE}/v1/groups/${gid}/payout-restriction`, {
-            headers: getHeaders(false),
+            headers: getHeaders(false, cfg),
         });
 
         return {
@@ -168,8 +311,9 @@ async function getPayoutRestriction(groupId = null) {
  * @param {string} groupId - Group ID (optional, ใช้จาก env ถ้าไม่ระบุ)
  * @returns {Promise<{ok: boolean, iconUrl?: string, error?: object}>}
  */
-async function getGroupIcon(groupId = null) {
-    const gid = groupId || getConfig().groupId;
+async function getGroupIcon(groupIdOrOptions = null) {
+    const cfg = resolveConfig(groupIdOrOptions);
+    const gid = cfg.groupId;
     if (!gid) {
         return { ok: false, error: { message: 'missing ROBLOX_GROUP_ID' } };
     }
@@ -182,7 +326,7 @@ async function getGroupIcon(groupId = null) {
                 format: 'Png',
                 isCircular: false,
             },
-            headers: getHeaders(false),
+            headers: getHeaders(false, cfg),
         });
 
         const iconData = res.data?.data?.[0];
@@ -208,9 +352,10 @@ async function getGroupIcon(groupId = null) {
  * @param {string} groupId - Group ID (optional, ใช้จาก env ถ้าไม่ระบุ)
  * @returns {Promise<{ok: boolean, error?: object}>}
  */
-async function makeOneTimePayout(userId, amount, groupId = null) {
-    const gid = groupId || getConfig().groupId;
-    const { cookie, totpSecret } = getConfig();
+async function makeOneTimePayout(userId, amount, groupIdOrOptions = null) {
+    const cfg = resolveConfig(groupIdOrOptions);
+    const gid = cfg.groupId;
+    const { cookie } = cfg;
 
     if (!gid) {
         return { ok: false, error: { message: 'missing ROBLOX_GROUP_ID' } };
@@ -238,7 +383,7 @@ async function makeOneTimePayout(userId, amount, groupId = null) {
     // Helper function สำหรับ payout request
     async function attemptPayout(extraHeaders = {}) {
         return axios.post(payoutUrl, payload, {
-            headers: { ...getHeaders(true), ...extraHeaders },
+            headers: { ...getHeaders(true, cfg), ...extraHeaders },
         });
     }
 
@@ -250,7 +395,7 @@ async function makeOneTimePayout(userId, amount, groupId = null) {
         // ถ้าได้ CSRF token กลับมา ให้ retry
         const newCsrf = err?.response?.headers?.['x-csrf-token'];
         if (err?.response?.status === 403 && newCsrf) {
-            csrfToken = newCsrf;
+            setCsrfToken(cookie, newCsrf);
 
             try {
                 const retryRes = await attemptPayout();
@@ -263,7 +408,7 @@ async function makeOneTimePayout(userId, amount, groupId = null) {
 
                 if (challengeId && challengeType === 'twostepverification') {
                     console.log('[Roblox] 2FA Challenge required:', challengeId);
-                    return await handle2FAChallenge(challengeId, challengeMetadata, payload, gid);
+                    return await handle2FAChallenge(challengeId, challengeMetadata, payload, gid, cfg);
                 }
 
                 return {
@@ -284,7 +429,7 @@ async function makeOneTimePayout(userId, amount, groupId = null) {
 
         if (challengeId && challengeType === 'twostepverification') {
             console.log('[Roblox] 2FA Challenge required:', challengeId);
-            return await handle2FAChallenge(challengeId, challengeMetadata, payload, gid);
+            return await handle2FAChallenge(challengeId, challengeMetadata, payload, gid, cfg);
         }
 
         return {
@@ -302,8 +447,8 @@ async function makeOneTimePayout(userId, amount, groupId = null) {
  * Handle 2FA Challenge สำหรับ Payout
  * Flow: 1) Verify TOTP → 2) Continue challenge → 3) Retry payout
  */
-async function handle2FAChallenge(firstChallengeId, challengeMetadataBase64, payload, groupId) {
-    const { totpSecret } = getConfig();
+async function handle2FAChallenge(firstChallengeId, challengeMetadataBase64, payload, groupId, configOverride = null) {
+    const { totpSecret } = resolveConfig(configOverride);
 
     if (!totpSecret) {
         return {
@@ -342,7 +487,7 @@ async function handle2FAChallenge(firstChallengeId, challengeMetadataBase64, pay
         console.log('[Roblox] User ID:', userId);
 
         // Generate TOTP code
-        const totpCode = generateTOTP();
+        const totpCode = generateTOTP(configOverride);
         if (!totpCode) {
             return {
                 ok: false,
@@ -360,7 +505,7 @@ async function handle2FAChallenge(firstChallengeId, challengeMetadataBase64, pay
                 actionType: 'Generic',
                 code: totpCode,
             },
-            { headers: getHeaders(true) }
+            { headers: getHeaders(true, configOverride) }
         );
 
         if (!verifyRes.data?.verificationToken) {
@@ -390,7 +535,7 @@ async function handle2FAChallenge(firstChallengeId, challengeMetadataBase64, pay
                 challengeMetadata: continueMetadata, // ต้องเป็น string ไม่ใช่ object
                 challengeType: 'twostepverification',
             },
-            { headers: getHeaders(true) }
+            { headers: getHeaders(true, configOverride) }
         );
 
         console.log('[Roblox] Step 2 success, challenge continued');
@@ -410,7 +555,7 @@ async function handle2FAChallenge(firstChallengeId, challengeMetadataBase64, pay
             payload,
             {
                 headers: {
-                    ...getHeaders(true),
+                    ...getHeaders(true, configOverride),
                     'rblx-challenge-id': firstChallengeId,
                     'rblx-challenge-type': 'twostepverification',
                     'rblx-challenge-metadata': responseMetadata,
@@ -497,9 +642,10 @@ async function getUserByUsername(username) {
  * @param {string} groupId - Group ID (optional, ใช้จาก env ถ้าไม่ระบุ)
  * @returns {Promise<{ok: boolean, eligible?: boolean, status?: string, message?: string, color?: number, userId?: number, username?: string}>}
  */
-async function checkRobloxEligibility(username, groupId = null) {
-    const gid = groupId || getConfig().groupId;
-    const { cookie } = getConfig();
+async function checkRobloxEligibility(username, groupIdOrOptions = null) {
+    const cfg = resolveConfig(groupIdOrOptions);
+    const gid = cfg.groupId;
+    const { cookie } = cfg;
 
     if (!gid) {
         return { ok: false, message: 'ยังไม่ได้ตั้งค่า ROBLOX_GROUP_ID', color: 0xed4245 };
@@ -524,7 +670,7 @@ async function checkRobloxEligibility(username, groupId = null) {
     try {
         const url = `${ECONOMY_API_BASE}/v1/groups/${gid}/users-payout-eligibility?userIds=${userId}`;
         const res = await axios.get(url, {
-            headers: getHeaders(false),
+            headers: getHeaders(false, cfg),
         });
 
         const status = res.data?.usersGroupPayoutEligibility?.[userId];
@@ -535,29 +681,32 @@ async function checkRobloxEligibility(username, groupId = null) {
 
         switch (status) {
             case 'Eligible':
-                message = `<:Ts_22_discord_1ture:1397892606209429584> ผู้ใช้ **${robloxUsername}** มีสิทธิ์รับ Robux แล้ว`;
+                // message = `ผู้ใช้ ${robloxUsername} มีสิทธิ์รับ Robux แล้ว`;
+                message = `ผู้ใช้ มีสิทธิ์รับ Robux แล้ว`;
                 color = 0x3ba55d;
                 eligible = true;
                 break;
             case 'NotInGroup':
-                message = `<:Ts_22_discord_1false:1397892604040974479> ผู้ใช้ **${robloxUsername}** ยังไม่ได้เข้ากลุ่ม`;
+                // message = `ผู้ใช้ ${robloxUsername} ยังไม่ได้เข้ากลุ่ม`;
+                message = `ผู้ใช้ ยังไม่ได้เข้ากลุ่ม`;
                 color = 0xed4245;
                 break;
             case 'NotEligibleDueToJoinDate':
             case 'PayoutRestricted':
-                message = `<:Ts_22_discord_1false:1397892604040974479> ผู้ใช้ **${robloxUsername}** ยังไม่ครบกำหนดเวลา 14 วัน หรือถูกจำกัดสิทธิ์`;
+                // message = `ผู้ใช้ ${robloxUsername} ยังไม่ครบกำหนดเวลา 14 วัน หรือถูกจำกัดสิทธิ์`;
+                message = `ผู้ใช้ ยังเข้าไม่ครบกำหนดเวลา 14 วัน หรือถูกจำกัดสิทธิ์`;
                 color = 0xed4245;
                 break;
             case 'GroupRestricted':
-                message = `<:Ts_22_discord_1false:1397892604040974479> กลุ่มนี้ไม่สามารถจ่าย Robux ได้ในขณะนี้`;
+                message = `กลุ่มนี้ไม่สามารถจ่าย Robux ได้ในขณะนี้`;
                 color = 0xed4245;
                 break;
             case 'UserRestricted':
-                message = `<:Ts_22_discord_1false:1397892604040974479> บัญชีผู้ใช้นี้ถูกจำกัด ไม่สามารถรับ Robux`;
+                message = `บัญชีผู้ใช้นี้ถูกจำกัด ไม่สามารถรับ Robux`;
                 color = 0xed4245;
                 break;
             default:
-                message = `<:Ts_22_discord_1false:1397892604040974479> ไม่สามารถตรวจสอบสถานะได้ (${status || 'Unknown'})`;
+                message = `ไม่สามารถตรวจสอบสถานะได้ (${status || 'Unknown'})`;
                 color = 0xed4245;
         }
 
@@ -621,8 +770,9 @@ async function getUserAvatarUrl(userId) {
  * @param {string} groupId - Group ID (optional, ใช้จาก env ถ้าไม่ระบุ)
  * @returns {Promise<{ok: boolean, data?: object, error?: object}>}
  */
-async function getGroupRevenueSummary(groupId = null) {
-    const gid = groupId || getConfig().groupId;
+async function getGroupRevenueSummary(groupIdOrOptions = null) {
+    const cfg = resolveConfig(groupIdOrOptions);
+    const gid = cfg.groupId;
 
     if (!gid) {
         return { ok: false, error: { message: 'missing ROBLOX_GROUP_ID' } };
@@ -631,7 +781,7 @@ async function getGroupRevenueSummary(groupId = null) {
     try {
         const res = await axios.get(
             `${TRANSACTION_API_BASE}/v1/groups/${gid}/revenue/summary/year`,
-            { headers: getHeaders(true) }
+            { headers: getHeaders(true, cfg) }
         );
 
         return {
@@ -656,6 +806,7 @@ async function getGroupRevenueSummary(groupId = null) {
 }
 
 module.exports = {
+    getGroupConfigs,
     getGroupInfo,
     getGroupFunds,
     getGroupIcon,

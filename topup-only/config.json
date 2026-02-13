@@ -1,0 +1,8 @@
+{
+  "allowedUserIds": [],
+  "settings": {
+    "minTopupAmount": 5,
+    "truemoneyFee": 5,
+    "slipCheckTimeout": 5
+  }
+}

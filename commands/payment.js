@@ -1,135 +1,207 @@
 // commands/payment.js
-const { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require("discord.js");
-const fs = require("fs"); const path = require("path");
-const { getGroupInfo, getGroupFunds, getGroupIcon, getConfig, getGroupRevenueSummary } = require("../api/roblox");
+const { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder } = require("discord.js");
+const { getGroupInfo, getGroupFunds, getGroupConfigs } = require("../api/roblox");
 
-// Helper function to get config from logdata.json
-function getLogdataConfig() {
-  try {
-    const logdataPath = path.join(__dirname, '..', 'update', 'logdata.json');
-    const data = fs.readFileSync(logdataPath, 'utf8');
-    return JSON.parse(data);
-  } catch (err) {
-    console.error('[Payment] Error reading logdata.json:', err.message);
-    return {};
+const refreshIntervals = new Map();
+const paymentGroupSelections = new Map();
+const SELECTION_TTL_MS = 10 * 60 * 1000; // 10 นาที
+const robuxCache = new Map();
+
+function resolveGroupKey(preferredKey, groupConfigs) {
+  if (!groupConfigs?.list?.length) return null;
+  if (preferredKey && groupConfigs.map?.[preferredKey]) return preferredKey;
+  if (groupConfigs.defaultKey && groupConfigs.map?.[groupConfigs.defaultKey]) {
+    return groupConfigs.defaultKey;
   }
+  return groupConfigs.list[0].key;
+}
+
+function setSelectedGroup(messageId, groupKey) {
+  if (!messageId || !groupKey) return;
+  paymentGroupSelections.set(messageId, { key: groupKey, ts: Date.now() });
+}
+
+function getSelectedGroup(messageId) {
+  const entry = paymentGroupSelections.get(messageId);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > SELECTION_TTL_MS) {
+    paymentGroupSelections.delete(messageId);
+    return null;
+  }
+  return entry.key || null;
 }
 
 /**
- * ดึงข้อมูล Roblox Group ทั้งหมด (ชื่อกลุ่ม, owner, memberCount, Robux balance, icon, revenue)
+ * ดึงข้อมูล Roblox Groups ทั้งหมด (รองรับหลายกลุ่ม)
  */
-async function fetchRobloxGroupData() {
+async function fetchAllRobloxGroupData() {
   try {
-    const [groupResult, fundsResult, iconResult, revenueResult] = await Promise.all([
-      getGroupInfo(),
-      getGroupFunds(),
-      getGroupIcon(),
-      getGroupRevenueSummary(),
-    ]);
+    const groupConfigs = getGroupConfigs();
+    if (!groupConfigs?.list?.length) return [];
 
-    if (!groupResult.ok) {
-      console.log('[Roblox] Failed to fetch group info:', groupResult.error?.message);
-      return null;
-    }
+    const results = await Promise.all(groupConfigs.list.map(async (group) => {
+      const options = { groupKey: group.key };
+      const [groupResult, fundsResult] = await Promise.all([
+        getGroupInfo(options),
+        getGroupFunds(options),
+      ]);
 
-    return {
-      groupId: getConfig().groupId,
-      name: groupResult.data?.name || 'Unknown Group',
-      description: groupResult.data?.description || '',
-      memberCount: groupResult.data?.memberCount || 0,
-      robux: fundsResult.ok ? fundsResult.robux : 0,
-      groupOwner: groupResult.data?.owner?.username || 'Unknown',
-      groupIconUrl: iconResult.ok ? iconResult.iconUrl : null,
-      // ข้อมูลรายได้/รายจ่าย
-      groupPayoutRobux: revenueResult.ok ? revenueResult.groupPayoutRobux : 0,
-      itemSaleRobux: revenueResult.ok ? revenueResult.itemSaleRobux : 0,
-      pendingRobux: revenueResult.ok ? revenueResult.pendingRobux : 0,
-    };
+      let robux = 0;
+      if (fundsResult.ok && Number.isFinite(fundsResult.robux)) {
+        robux = fundsResult.robux;
+        robuxCache.set(group.key, { value: robux, ts: Date.now() });
+      } else if (robuxCache.has(group.key)) {
+        robux = robuxCache.get(group.key).value;
+      }
+
+      return {
+        groupKey: group.key,
+        groupId: groupResult.ok ? groupResult.data?.id : (group.groupId || group.key),
+        name: groupResult.ok ? groupResult.data?.name : (group.name || `Group ${group.groupId || group.key}`),
+        robux,
+      };
+    }));
+
+    return results;
   } catch (err) {
     console.error('[Roblox] Error fetching group data:', err.message);
-    return null;
+    return [];
   }
 }
 
 /**
  * สร้าง Embed สำหรับ Payment
  */
-function buildPaymentEmbed(group) {
-  // Get rate from logdata.json to determine image
-  const logdata = getLogdataConfig();
-  const rate = parseFloat(logdata.ROBUX_RATE) || 3.5;
+function buildPaymentEmbed(groups) {
+  const imageUrl = "https://img5.pic.in.th/file/secure-sv1/Roblox_Rate3.5.png";
+  const numberEmojis = [
+    { id: "1465109778371182846", name: "emj_no_01" },
+    { id: "1465109782078689310", name: "emj_no_02" },
+    { id: "1465109784335355998", name: "emj_no_03" },
+  ];
 
-  // Select image based on rate
-  let imageUrl;
-  if (rate >= 4) {
-    imageUrl = "https://img5.pic.in.th/file/secure-sv1/IMG_40467ca492945914eecc.png";
-  } else {
-    // Default to 3.5 rate image
-    imageUrl = "https://img2.pic.in.th/875bf3130939b2ba.png";
-  }
+  const fields = (groups || []).slice(0, 3).map((group, index) => {
+    const label = "Robux กลุ่ม";
+    const emoji = numberEmojis[index];
+    const emojiText = emoji ? ` <:${emoji.name}:${emoji.id}>` : "";
+    return {
+      name: `${label}${emojiText}`,
+      value: `\`\`\`${Number(group.robux || 0).toLocaleString()}\`\`\``,
+      inline: true,
+    };
+  });
 
-  console.log(`[Payment] ROBUX_RATE: ${logdata.ROBUX_RATE}, parsed rate: ${rate}, using image: ${rate >= 4 ? 'rate 4' : 'rate 3.5'}`);
+  const description = [
+    "> <:Ts_5_discord_book:1397694174488297552> คู่มือการใช้งาน",
+    "```เลือกกลุ่มที่ต้องการซื้อก่อน | กดเติมเงิน | กดซื้อสินค้า ```",
+    "> <:Ts_12_discord_abane:1397694204863315998> หมายเหตุ",
+    "```เติมเงินให้เพียงพอ ก่อนซื้อแพ็คที่ต้องการ```",
+  ].join("\n");
 
-  const embed = new EmbedBuilder()
-    .setColor('#EFFCFF')
-    .setTitle('Robux group auto 24 hours')
-    .setFooter({ text: '© discord.gg/snowwhite | All Rights Reserved.' })
-    .addFields(
-      {
-        name: '<:Icon_Square_robux_1:1397902872146083861> Robux คงเหลือ',
-        value: `\`\`\`${group.robux.toLocaleString()}\`\`\``,
-        inline: false
-      },
-      {
-        name: '📋 วิธีการเติมโรกลุ่ม',
-        value: `\`\`\`กด เติมเงิน → ส่งสลิปการโอน → กด ซื้อ Robux โรจะเข้าตัวทันที\`\`\``,
-        inline: false
-      },
-      {
-        name: '📌 ข้อควรรู้',
-        value: `\`\`\`• สลิปที่ไม่มี Qrcode ระบบจะตรวจสอบยอดเงินไม่ได้ ให้ส่งสลิปมาใน <#ห้องทิกเกต>\n• เติมเงินผ่านซองวอเลต มีค่าธรรมเนียม 5 บาท หากจะเติม 200 บาท ให้ใส่จำนวน 205 บาท\n• สามารถเช็คว่าเติมได้หรือไม่ได้ กดที่ ซื้อโรบัค แล้วใส่ username (ชื่อในเกม หลัง@) เพื่อเช็คได้ทันที\`\`\``,
-        inline: false
-      }
-    )
-    .setImage(imageUrl);
-
-  return embed;
+  return new EmbedBuilder()
+    .setColor(15902662)
+    .setTitle("❥・ 　Roblox Auto 24 hrs.")
+    .setDescription(description)
+    .setImage(imageUrl)
+    .addFields(fields);
 }
 
 /**
- * สร้าง Button Rows
+ * สร้าง Rows สำหรับ Payment (รองรับหลายกลุ่ม)
  */
-function buildButtonRows(groupId) {
+function buildGroupSelectRow(groupConfigs, groups, selectedKey) {
+  if (!groupConfigs?.list?.length || groupConfigs.list.length < 2) return null;
+
+  const numberEmojis = [
+    { id: "1465109778371182846", name: "emj_no_01" },
+    { id: "1465109782078689310", name: "emj_no_02" },
+    { id: "1465109784335355998", name: "emj_no_03" },
+  ];
+
+  const groupDataByKey = new Map((groups || []).map((group) => [group.groupKey, group]));
+
+  const options = groupConfigs.list.slice(0, 25).map((group, index) => {
+    const data = groupDataByKey.get(group.key);
+    const emoji = numberEmojis[index];
+    return {
+      label: String(group.name || `Robux กลุ่ม ${index + 1}`),
+      value: String(group.key),
+      description: `ยอดคงเหลือ ${Number(data?.robux || 0).toLocaleString()}`,
+      emoji: emoji ? { id: emoji.id, name: emoji.name } : undefined,
+      default: group.key === selectedKey,
+    };
+  });
+
+  options.push({
+    label: "รีโหลดตัวเลือก",
+    value: "reload",
+    emoji: { id: "1397892630729461841", name: "Ts_22_discord_3loading", animated: true },
+  });
+
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId("payment_group_select")
+      .setPlaceholder("เลือกกลุ่มที่ต้องการซื้อ")
+      .addOptions(options)
+  );
+}
+
+function buildPaymentComponents(group, groupConfigs, selectedKey, groups, showGroupLink = false) {
+  const rows = [];
+  const selectRow = buildGroupSelectRow(groupConfigs, groups, selectedKey);
+  if (selectRow) rows.push(selectRow);
+
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('buy_topup')
       .setLabel('เติมเงิน')
-      .setEmoji('<:Ts_19_discord_coin:1397694253676630066>')
+      .setEmoji('<:Ts_0_discord_bank:1398972893416914965>')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('roblox_check')
+      .setLabel('ซื้อสินค้า')
+      .setEmoji('<:Ts_20_discord_shop:1397694256067514622>')
       .setStyle(ButtonStyle.Danger),
     new ButtonBuilder()
       .setCustomId('chack_topup')
       .setLabel('เช็คยอดเงิน')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId('roblox_check')
-      .setLabel('ซื้อ Robux')
-      .setEmoji('<:Ts_20_discord_shop:1397694256067514622>')
+      .setEmoji('<:Ts_19_discord_coin:1397694253676630066>')
       .setStyle(ButtonStyle.Primary)
   );
 
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setStyle(ButtonStyle.Link)
-      .setLabel('เข้าร่วมกลุ่ม Roblox คลิกที่นี่')
-      .setURL(`https://www.roblox.com/groups/${groupId}`)
-      .setEmoji('<:Icon_Square_roblox_1:1397902874809204767>')
-  );
+  if (showGroupLink && group?.groupId) {
+    row1.addComponents(
+      new ButtonBuilder()
+        .setStyle(ButtonStyle.Link)
+        .setLabel('ลิ้งกลุ่ม')
+        .setEmoji('<:Icon_Square_roblox_1:1397902874809204767>')
+        .setURL(`https://www.roblox.com/groups/${group.groupId}`)
+    );
+  }
 
-  return [row1, row2];
+  rows.push(row1);
+  return rows;
 }
 
-// เก็บ interval ของแต่ละ message
-const refreshIntervals = new Map();
+async function buildPaymentPayload(groupKey = null, opts = {}) {
+  const { explicitSelection = false } = opts;
+  const groupConfigs = getGroupConfigs();
+  const resolvedKey = resolveGroupKey(groupKey, groupConfigs);
+  const groups = await fetchAllRobloxGroupData();
+  if (!groups.length) return null;
+
+  const selected = groups.find((g) => g.groupKey === resolvedKey) || groups[0];
+  const embed = buildPaymentEmbed(groups);
+  const menuSelectedKey = explicitSelection ? (resolvedKey || selected.groupKey) : null;
+  const components = buildPaymentComponents(
+    selected,
+    groupConfigs,
+    menuSelectedKey,
+    groups,
+    explicitSelection
+  );
+  return { embed, components, groupKey: resolvedKey || selected.groupKey, group: selected, groups };
+}
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -146,10 +218,8 @@ module.exports = {
       return interaction.editReply("❌ ไม่พบห้องปลายทางหรือส่งข้อความไม่ได้");
     }
 
-    // ดึงข้อมูล Roblox Group
-    const group = await fetchRobloxGroupData();
-
-    if (!group) {
+    const payload = await buildPaymentPayload(null, { explicitSelection: false });
+    if (!payload) {
       // Fallback - ถ้าดึงข้อมูลไม่ได้
       const embed = new EmbedBuilder()
         .setColor('#EFFCFF')
@@ -179,10 +249,10 @@ module.exports = {
     }
 
     // สร้างและส่ง embed
-    const embed = buildPaymentEmbed(group);
-    const [row1, row2] = buildButtonRows(group.groupId);
-    const sentMessage = await channel.send({ embeds: [embed], components: [row1, row2] });
-
+    const sentMessage = await channel.send({
+      embeds: [payload.embed],
+      components: payload.components,
+    });
     // ตั้ง auto-refresh ทุก 10 วินาที
     const REFRESH_INTERVAL = 10000; // 10 วินาที
 
@@ -194,24 +264,31 @@ module.exports = {
           // Message ถูกลบแล้ว - หยุด refresh
           clearInterval(intervalId);
           refreshIntervals.delete(sentMessage.id);
+          paymentGroupSelections.delete(sentMessage.id);
           console.log(`[Payment] Stopped refresh for deleted message ${sentMessage.id}`);
           return;
         }
 
-        // ดึงข้อมูลใหม่
-        const newGroup = await fetchRobloxGroupData();
-        if (!newGroup) return;
+        const selectedKey = getSelectedGroup(sentMessage.id);
+        const explicitSelection = !!selectedKey;
+        const refreshed = await buildPaymentPayload(
+          selectedKey || payload.groupKey,
+          { explicitSelection }
+        );
+        if (!refreshed) return;
 
-        // อัพเดท embed
-        const newEmbed = buildPaymentEmbed(newGroup);
-        await msg.edit({ embeds: [newEmbed], components: [row1, row2] });
-        console.log(`[Payment] Refreshed Robux: ${newGroup.robux}`);
+        await msg.edit({
+          embeds: [refreshed.embed],
+          components: refreshed.components,
+        });
+        console.log(`[Payment] Refreshed Robux (${refreshed.groupKey}): ${refreshed.group?.robux ?? 0}`);
       } catch (err) {
         console.error('[Payment] Auto-refresh error:', err.message);
         // ถ้า error ซ้ำ ๆ ให้หยุด
         if (err.message.includes('Unknown Message') || err.message.includes('Missing Access')) {
           clearInterval(intervalId);
           refreshIntervals.delete(sentMessage.id);
+          paymentGroupSelections.delete(sentMessage.id);
         }
       }
     }, REFRESH_INTERVAL);
@@ -220,5 +297,11 @@ module.exports = {
     refreshIntervals.set(sentMessage.id, intervalId);
 
     await interaction.editReply(`✅ ส่ง embed ไปที่ <#${channelId}> แล้ว (อัพเดททุก 10 วินาที)`);
-  }
+  },
+  buildPaymentPayload,
+  resolveGroupKey,
+  setSelectedGroup,
+  getSelectedGroup,
+  paymentGroupSelections,
+  refreshIntervals,
 };

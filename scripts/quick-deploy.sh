@@ -79,12 +79,18 @@ az webapp config appsettings set \
 ## Push environment variables from .env if present
 if [ -f .env ]; then
   echo "🔧 Applying environment variables from .env ..."
-  # Convert KEY=VALUE lines to space-separated list for az
-  settings=$(grep -v '^#' .env | grep -v '^$' | tr '\n' ' ')
+  # Convert KEY=VALUE lines to array for az (preserve spaces)
+  settings=()
+  while IFS= read -r line; do
+    if [[ -z "$line" || "$line" =~ ^# ]]; then
+      continue
+    fi
+    settings+=("$line")
+  done < .env
   az webapp config appsettings set \
     --resource-group "$RESOURCE_GROUP" \
     --name "$APP_NAME" \
-    --settings $settings PORT=8080 \
+    --settings "${settings[@]}" PORT=8080 \
     --output none
 else
   echo "⚠️  No .env found. Remember to set app settings later."
