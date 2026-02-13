@@ -31,7 +31,7 @@ const client = new Client({
 });
 
 // เพิ่มเพดาน listener ทันที (ก่อน bind event) กัน warning MaxListeners
-client.setMaxListeners(50);
+client.setMaxListeners(20);
 
 // ป้องกัน Event ซ้อน: เก็บรายการ (eventName,filePath) ที่ bind ไปแล้ว
 const boundEvents = new Set();
@@ -105,8 +105,6 @@ client.once(Events.ClientReady, () => {
   try {
     client.user.setActivity("Top-up Service", { type: ActivityType.Playing });
   } catch {}
-  // เพิ่มเพดาน listener หากโปรเจ็กต์มีหลาย handler (ซ้ำอีกรอบสำหรับ safety)
-  client.setMaxListeners(50);
 
   // Diagnostic: log how many application commands are registered (global / guild)
   (async () => {
